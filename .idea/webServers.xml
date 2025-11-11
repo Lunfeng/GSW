@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="28a69f54-8ca8-4b4f-898f-a0654d998410" name="gswater">
+        <fileTransfer rootFolder="/data/xjf" accessType="SFTP" host="10.21.22.49" port="22" sshConfigId="3955111e-5db7-4191-b627-c5213d3b49ad" sshConfig="xjf@10.21.22.49:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
