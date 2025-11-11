@@ -15,7 +15,7 @@ import uuid
 # os.environ['CUDA_VISIBLE_DEVICES'] = str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 # os.system('echo running in gpu $CUDA_VISIBLE_DEVICES')
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
 # ------------------ 自己的库 ------------------
 from gaussian_renderer import render
@@ -80,28 +80,66 @@ class WatermarkEncoder(nn.Module):
 
 
 # ------------------ 解码器 ------------------
-class WatermarkDecoder(nn.Module):
-    def __init__(self, wm_dim=32):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)  # H*W -> 1*1
-        )
-        self.fc = nn.Linear(64, wm_dim)
+# class WatermarkDecoder(nn.Module):
+#     def __init__(self, wm_dim=32):
+#         super().__init__()
+#         self.encoder = nn.Sequential(
+#             nn.Conv2d(3, 32, kernel_size=3, padding=1),
+#             nn.ReLU(),
+#             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+#             nn.ReLU(),
+#             nn.AdaptiveAvgPool2d(1)  # H*W -> 1*1
+#         )
+#         self.fc = nn.Linear(64, wm_dim)
+#
+#     def forward(self, render_img):
+#         """
+#         render_img: (B,3,H,W)
+#         returns: (B, wm_dim)
+#         """
+#         render_img = render_img.unsqueeze(0)
+#         features = self.encoder(render_img)
+#         features = features.view(features.size(0), -1)
+#         wm_pred = self.fc(features)
+#         return wm_pred
 
-    def forward(self, render_img):
-        """
-        render_img: (B,3,H,W)
-        returns: (B, wm_dim)
-        """
-        render_img = render_img.unsqueeze(0)
-        features = self.encoder(render_img)
-        features = features.view(features.size(0), -1)
-        wm_pred = self.fc(features)
-        return wm_pred
+import torch
+import torch.nn as nn
+
+class WatermarkDecoder(nn.Module):
+    def __init__(self, wm_dim=32, width=64):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, width, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width, width, 3, 1, 1), nn.ReLU(inplace=True),
+        )
+        self.down1 = nn.Sequential(
+            nn.AvgPool2d(2),
+            nn.Conv2d(width, width*2, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width*2, width*2, 3, 1, 1), nn.ReLU(inplace=True),
+        )
+        self.down2 = nn.Sequential(
+            nn.AvgPool2d(2),
+            nn.Conv2d(width*2, width*4, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width*4, width*4, 3, 1, 1), nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Linear(width + width*2 + width*4, 256), nn.ReLU(inplace=True),
+            nn.Linear(256, wm_dim)
+        )
+
+    def forward(self, x_bchw):
+        # x: (B,3,H,W)
+        x_bchw = x_bchw.unsqueeze(0)
+        f1 = self.stem(x_bchw)      # (B,w,H,W)
+        f2 = self.down1(f1)         # (B,2w,H/2,W/2)
+        f3 = self.down2(f2)         # (B,4w,H/4,W/4)
+        g1 = self.pool(f1).flatten(1)
+        g2 = self.pool(f2).flatten(1)
+        g3 = self.pool(f3).flatten(1)
+        g  = torch.cat([g1,g2,g3], dim=1)
+        return self.head(g)         # (B, wm_dim)
 
 
 # ------------------ 训练函数 ------------------
@@ -162,6 +200,19 @@ def training(dataset, opt, pipe, args):
         loss.backward()
 
         with torch.no_grad():
+            if iteration % 100 == 0 or iteration == opt.water_iterations:
+                target = viewpoint_cam.original_image.cuda()
+                pred = render_image
+                mse = torch.mean((target - pred) ** 2).item()
+                psnr = 10.0 * np.log10(1.0 / mse) if mse > 0 else float('inf')
+                ssim_val = ssim(target, pred)
+                if isinstance(ssim_val, torch.Tensor):
+                    ssim_val = ssim_val.item()
+                print(f"[ITER {iteration}] PSNR: {psnr:.4f} dB, SSIM: {ssim_val:.4f}")
+                if tb_writer:
+                    tb_writer.add_scalar('metrics/PSNR', psnr, iteration)
+                    tb_writer.add_scalar('metrics/SSIM', ssim_val, iteration)
+
             # Progress bar
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
