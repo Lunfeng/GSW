@@ -15,7 +15,7 @@ import uuid
 # os.environ['CUDA_VISIBLE_DEVICES'] = str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 # os.system('echo running in gpu $CUDA_VISIBLE_DEVICES')
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 
 # ------------------ 自己的库 ------------------
 from gaussian_renderer import render
@@ -141,6 +141,27 @@ class WatermarkDecoder(nn.Module):
         g  = torch.cat([g1,g2,g3], dim=1)
         return self.head(g)         # (B, wm_dim)
 
+def compute_ber_from_logits(wm_logits, true_bits, threshold=0.5, use_sigmoid=True, per_sample=False, tb_writer=None, step=None, progress_bar=None, tb_tag='metrics/BER'):
+    if wm_logits.dim() == 1:
+        wm_logits = wm_logits.unsqueeze(0)
+    if true_bits.dim() == 1:
+        true_bits = true_bits.unsqueeze(0)
+    if true_bits.shape[0] == 1 and wm_logits.shape[0] > 1:
+        true_bits = true_bits.expand(wm_logits.shape[0], -1)
+    if true_bits.shape != wm_logits.shape:
+        raise ValueError(f"shape mismatch: wm_logits {wm_logits.shape}, true_bits {true_bits.shape}")
+
+    if use_sigmoid:
+        preds = (torch.sigmoid(wm_logits) > threshold)
+    else:
+        preds = (wm_logits > 0.0)
+    trues = (true_bits > 0.5)
+
+    diff = (preds != trues).float()
+    per_sample_ber = diff.mean(dim=1)
+    mean_ber = per_sample_ber.mean().item()
+
+    return per_sample_ber if per_sample else mean_ber
 
 # ------------------ 训练函数 ------------------
 def training(dataset, opt, pipe, args):
@@ -200,6 +221,11 @@ def training(dataset, opt, pipe, args):
         loss.backward()
 
         with torch.no_grad():
+            # 在训练循环中（在 `wm_pred = decoder(render_image)` 之后，loss 计算前或后均可），插入如下调用：
+            # 计算并输出 BER（示例放在解码后）
+            ber = compute_ber_from_logits(wm_pred, message, threshold=0.5, use_sigmoid=True, per_sample=False,
+                                          tb_writer=tb_writer, step=iteration, progress_bar=progress_bar)
+            # print(f"[ITER {iteration}] BER: {ber:.4f}")
             if iteration % 100 == 0 or iteration == opt.water_iterations:
                 target = viewpoint_cam.original_image.cuda()
                 pred = render_image
@@ -208,15 +234,16 @@ def training(dataset, opt, pipe, args):
                 ssim_val = ssim(target, pred)
                 if isinstance(ssim_val, torch.Tensor):
                     ssim_val = ssim_val.item()
-                print(f"[ITER {iteration}] PSNR: {psnr:.4f} dB, SSIM: {ssim_val:.4f}")
+                print(f"[ITER {iteration}] PSNR: {psnr:.2f} dB, SSIM: {ssim_val:.2f}, BER: {ber:.2f}")
                 if tb_writer:
                     tb_writer.add_scalar('metrics/PSNR', psnr, iteration)
                     tb_writer.add_scalar('metrics/SSIM', ssim_val, iteration)
+                    tb_writer.add_scalar('metrics/BER', ber, iteration)
 
             # Progress bar
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
-                    {"Loss": f"{loss.item():.{7}f}", "loss_message": f"{loss_message.item():.{7}f}"})
+                    {"Loss": f"{loss.item():.{3}f}", "l_m": f"{loss_message.item():.{3}f}", "l_r": f"{loss_render.item():.{3}f}", "BER": f"{ber:.3f}"})
                 progress_bar.update(10)
             if iteration == opt.water_iterations:
                 progress_bar.close()
