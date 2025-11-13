@@ -55,28 +55,41 @@ def prepare_output_and_logger(args):
 
 # ------------------ 编码器 ------------------
 class WatermarkEncoder(nn.Module):
+    """FiLM 风格的编码器，对颜色与消息分别建模后进行逐通道调制"""
+
     def __init__(self, color_dim=3, wm_dim=32, hidden_dim=128):
         super().__init__()
         self.color_dim = color_dim
         self.wm_dim = wm_dim
-        self.net = nn.Sequential(
-            nn.Linear(color_dim + wm_dim, hidden_dim),
-            nn.ReLU(),
+        self.base_net = nn.Sequential(
+            nn.Linear(color_dim, hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, color_dim),
-            nn.Tanh()  # 限制输出颜色变化范围 [-1,1]
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, color_dim)
+        )
+        self.film_gen = nn.Sequential(
+            nn.Linear(wm_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, color_dim * 2)
         )
 
     def forward(self, colors, wm_bits):
         """
         colors: (N,3)
         wm_bits: (wm_dim,) or (1, wm_dim)
+        返回扰动后的颜色，形状与 colors 相同
         """
+        if wm_bits.dim() == 1:
+            wm_bits = wm_bits.unsqueeze(0)
+        wm_bits = wm_bits.to(colors.dtype)
         wm_bits_exp = wm_bits.expand(colors.shape[0], -1)
-        x = torch.cat([colors, wm_bits_exp], dim=1)
-        wm_colors = self.net(x)
-        return wm_colors
+        base_feat = self.base_net(colors)
+        gamma_beta = self.film_gen(wm_bits_exp)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+        modulation = gamma * base_feat + beta
+        residual = torch.tanh(modulation)
+        return colors + residual
 
 
 # ------------------ 解码器 ------------------
@@ -106,40 +119,89 @@ class WatermarkEncoder(nn.Module):
 import torch
 import torch.nn as nn
 
+
 class WatermarkDecoder(nn.Module):
     def __init__(self, wm_dim=32, width=64):
         super().__init__()
+        self.wm_dim = wm_dim
+        # 空域分支
         self.stem = nn.Sequential(
             nn.Conv2d(3, width, 3, 1, 1), nn.ReLU(inplace=True),
             nn.Conv2d(width, width, 3, 1, 1), nn.ReLU(inplace=True),
         )
         self.down1 = nn.Sequential(
             nn.AvgPool2d(2),
-            nn.Conv2d(width, width*2, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(width*2, width*2, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width, width * 2, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width * 2, width * 2, 3, 1, 1), nn.ReLU(inplace=True),
         )
         self.down2 = nn.Sequential(
             nn.AvgPool2d(2),
-            nn.Conv2d(width*2, width*4, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(width*4, width*4, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width * 2, width * 4, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width * 4, width * 4, 3, 1, 1), nn.ReLU(inplace=True),
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
+        spatial_dim = width + width * 2 + width * 4
+
+        # 频域分支
+        self.freq_branch = nn.Sequential(
+            nn.Conv2d(3, width, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.AvgPool2d(2),
+            nn.Conv2d(width, width * 2, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(width * 2, width * 2, 3, 1, 1), nn.ReLU(inplace=True)
+        )
+        self.freq_pool = nn.AdaptiveAvgPool2d(1)
+        freq_dim = width * 2
+
+        self.spatial_proj = nn.Linear(spatial_dim, 256)
+        self.freq_proj = nn.Linear(freq_dim, 256)
+        self.attention = nn.Sequential(
+            nn.Linear(512, 256), nn.ReLU(inplace=True),
+            nn.Linear(256, 1)
+        )
         self.head = nn.Sequential(
-            nn.Linear(width + width*2 + width*4, 256), nn.ReLU(inplace=True),
+            nn.Linear(256, 256), nn.ReLU(inplace=True),
             nn.Linear(256, wm_dim)
         )
 
+    @staticmethod
+    def _fft_magnitude(x):
+        freq = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
+        return torch.sqrt(freq.real ** 2 + freq.imag ** 2 + 1e-6)
+
     def forward(self, x_bchw):
-        # x: (B,3,H,W)
-        x_bchw = x_bchw.unsqueeze(0)
-        f1 = self.stem(x_bchw)      # (B,w,H,W)
-        f2 = self.down1(f1)         # (B,2w,H/2,W/2)
-        f3 = self.down2(f2)         # (B,4w,H/4,W/4)
+        if x_bchw.dim() == 3:
+            x_bchw = x_bchw.unsqueeze(0)
+
+        f1 = self.stem(x_bchw)
+        f2 = self.down1(f1)
+        f3 = self.down2(f2)
         g1 = self.pool(f1).flatten(1)
         g2 = self.pool(f2).flatten(1)
         g3 = self.pool(f3).flatten(1)
-        g  = torch.cat([g1,g2,g3], dim=1)
-        return self.head(g)         # (B, wm_dim)
+        spatial_feat = torch.cat([g1, g2, g3], dim=1)
+
+        freq_input = self._fft_magnitude(x_bchw)
+        freq_feat = self.freq_branch(freq_input)
+        freq_feat = self.freq_pool(freq_feat).flatten(1)
+
+        spatial_embed = self.spatial_proj(spatial_feat)
+        freq_embed = self.freq_proj(freq_feat)
+        attn = torch.sigmoid(self.attention(torch.cat([spatial_embed, freq_embed], dim=1)))
+        fused = attn * spatial_embed + (1 - attn) * freq_embed
+        return self.head(fused)
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, dim, hidden=128, out_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 def compute_ber_from_logits(wm_logits, true_bits, threshold=0.5, use_sigmoid=True, per_sample=False, tb_writer=None, step=None, progress_bar=None, tb_tag='metrics/BER'):
     if wm_logits.dim() == 1:
@@ -163,6 +225,23 @@ def compute_ber_from_logits(wm_logits, true_bits, threshold=0.5, use_sigmoid=Tru
 
     return per_sample_ber if per_sample else mean_ber
 
+
+def info_nce_loss(message_bits, pred_logits, msg_projector, pred_projector, temperature=0.07, num_negatives=16):
+    """基于 InfoNCE 的互信息最大化目标"""
+    if message_bits.dim() == 1:
+        message_bits = message_bits.unsqueeze(0)
+    negatives = torch.randint(
+        0, 2, (num_negatives, message_bits.shape[1]), device=message_bits.device, dtype=message_bits.dtype
+    )
+    all_messages = torch.cat([message_bits, negatives], dim=0)
+    msg_embed = F.normalize(msg_projector(all_messages), dim=-1)
+    pred_embed = F.normalize(pred_projector(torch.sigmoid(pred_logits)), dim=-1)
+    pos = torch.sum(pred_embed * msg_embed[0:1], dim=-1, keepdim=True)
+    neg = pred_embed @ msg_embed[1:].T
+    logits = torch.cat([pos, neg], dim=-1) / temperature
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+    return F.cross_entropy(logits, labels)
+
 # ------------------ 训练函数 ------------------
 def training(dataset, opt, pipe, args):
     tb_writer = prepare_output_and_logger(dataset)
@@ -179,10 +258,15 @@ def training(dataset, opt, pipe, args):
 
     encoder = WatermarkEncoder(color_dim=3, wm_dim=args.message_length).to(device)
     decoder = WatermarkDecoder(wm_dim=args.message_length).to(device)
+    msg_projector = ProjectionHead(args.message_length).to(device)
+    pred_projector = ProjectionHead(args.message_length).to(device)
     optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(decoder.parameters()), lr=1e-4
+        list(encoder.parameters()) +
+        list(decoder.parameters()) +
+        list(msg_projector.parameters()) +
+        list(pred_projector.parameters()), lr=1e-4
     )
-    criterion_MSE = nn.MSELoss()
+    criterion_BCE = nn.BCEWithLogitsLoss()
 
     viewpoint_stack = None
     progress_bar = tqdm(range(1, opt.water_iterations + 1), desc="Training progress")
@@ -200,7 +284,7 @@ def training(dataset, opt, pipe, args):
         colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
 
         # 随机生成水印比特
-        message = torch.Tensor(np.random.choice([0, 1], (1, args.message_length))).to(device)
+        message = torch.randint(0, 2, (1, args.message_length), device=device, dtype=torch.float32)
 
         # 编码
         wm_color = encoder(colors_precomp, message)
@@ -214,8 +298,16 @@ def training(dataset, opt, pipe, args):
         loss_render = (1.0 - opt.lambda_dssim) * l1_loss(viewpoint_cam.original_image.cuda(), render_image) + \
                       opt.lambda_dssim * (1.0 - ssim(viewpoint_cam.original_image.cuda(), render_image))
 
-        loss_message = criterion_MSE(message, wm_pred)
-        loss = loss_render + loss_message
+        loss_message = criterion_BCE(wm_pred, message)
+        loss_info = info_nce_loss(
+            message,
+            wm_pred,
+            msg_projector,
+            pred_projector,
+            temperature=args.info_temperature,
+            num_negatives=args.num_info_negatives
+        )
+        loss = loss_render + args.lambda_message * loss_message + args.lambda_info * loss_info
 
         # backward
         loss.backward()
@@ -243,7 +335,11 @@ def training(dataset, opt, pipe, args):
             # Progress bar
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
-                    {"Loss": f"{loss.item():.{3}f}", "l_m": f"{loss_message.item():.{3}f}", "l_r": f"{loss_render.item():.{3}f}", "BER": f"{ber:.3f}"})
+                    {"Loss": f"{loss.item():.{3}f}",
+                     "l_m": f"{loss_message.item():.{3}f}",
+                     "l_i": f"{loss_info.item():.{3}f}",
+                     "l_r": f"{loss_render.item():.{3}f}",
+                     "BER": f"{ber:.3f}"})
                 progress_bar.update(10)
             if iteration == opt.water_iterations:
                 progress_bar.close()
@@ -282,6 +378,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default="chkpnt30000.pth")
     parser.add_argument("--message_length", type=int, default=32)
+    parser.add_argument("--lambda_message", type=float, default=1.0)
+    parser.add_argument("--lambda_info", type=float, default=0.1)
+    parser.add_argument("--info_temperature", type=float, default=0.07)
+    parser.add_argument("--num_info_negatives", type=int, default=32)
 
     args = parser.parse_args()
     safe_state(args.quiet)
