@@ -8,6 +8,7 @@ from random import randint
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 import uuid
+import random
 
 # ------------------ GPU选择 ------------------
 # cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
@@ -15,7 +16,7 @@ import uuid
 # os.environ['CUDA_VISIBLE_DEVICES'] = str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 # os.system('echo running in gpu $CUDA_VISIBLE_DEVICES')
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
 # ------------------ 自己的库 ------------------
 from gaussian_renderer import render
@@ -32,6 +33,7 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
 
 # ------------------ 输出和日志 ------------------
 def prepare_output_and_logger(args):
@@ -53,194 +55,115 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 
-# ------------------ 编码器 ------------------
-class WatermarkEncoder(nn.Module):
-    """FiLM 风格的编码器，对颜色与消息分别建模后进行逐通道调制"""
+# ------------------ 工具函数 ------------------
+def build_sh_degree_index(max_sh_degree: int) -> torch.Tensor:
+    # 生成每个基函数对应的阶数 l 索引: [0, 1,1,1, 2,2,2,2,2, ...]
+    degrees = []
+    for l in range(max_sh_degree + 1):
+        degrees += [l] * (2 * l + 1)
+    return torch.tensor(degrees, dtype=torch.float32, device=device)
 
-    def __init__(self, color_dim=3, wm_dim=32, hidden_dim=128):
-        super().__init__()
-        self.color_dim = color_dim
-        self.wm_dim = wm_dim
-        self.base_net = nn.Sequential(
-            nn.Linear(color_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, color_dim)
-        )
-        self.film_gen = nn.Sequential(
-            nn.Linear(wm_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, color_dim * 2)
-        )
-
-    def forward(self, colors, wm_bits):
-        """
-        colors: (N,3)
-        wm_bits: (wm_dim,) or (1, wm_dim)
-        返回扰动后的颜色，形状与 colors 相同
-        """
-        if wm_bits.dim() == 1:
-            wm_bits = wm_bits.unsqueeze(0)
-        wm_bits = wm_bits.to(colors.dtype)
-        wm_bits_exp = wm_bits.expand(colors.shape[0], -1)
-        base_feat = self.base_net(colors)
-        gamma_beta = self.film_gen(wm_bits_exp)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        modulation = gamma * base_feat + beta
-        residual = torch.tanh(modulation)
-        return colors + residual
-
-
-# ------------------ 解码器 ------------------
-# class WatermarkDecoder(nn.Module):
-#     def __init__(self, wm_dim=32):
-#         super().__init__()
-#         self.encoder = nn.Sequential(
-#             nn.Conv2d(3, 32, kernel_size=3, padding=1),
-#             nn.ReLU(),
-#             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-#             nn.ReLU(),
-#             nn.AdaptiveAvgPool2d(1)  # H*W -> 1*1
-#         )
-#         self.fc = nn.Linear(64, wm_dim)
-#
-#     def forward(self, render_img):
-#         """
-#         render_img: (B,3,H,W)
-#         returns: (B, wm_dim)
-#         """
-#         render_img = render_img.unsqueeze(0)
-#         features = self.encoder(render_img)
-#         features = features.view(features.size(0), -1)
-#         wm_pred = self.fc(features)
-#         return wm_pred
-
-import torch
-import torch.nn as nn
-
-
-class WatermarkDecoder(nn.Module):
-    def __init__(self, wm_dim=32, width=64):
-        super().__init__()
-        self.wm_dim = wm_dim
-        # 空域分支
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, width, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(width, width, 3, 1, 1), nn.ReLU(inplace=True),
-        )
-        self.down1 = nn.Sequential(
-            nn.AvgPool2d(2),
-            nn.Conv2d(width, width * 2, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(width * 2, width * 2, 3, 1, 1), nn.ReLU(inplace=True),
-        )
-        self.down2 = nn.Sequential(
-            nn.AvgPool2d(2),
-            nn.Conv2d(width * 2, width * 4, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(width * 4, width * 4, 3, 1, 1), nn.ReLU(inplace=True),
-        )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        spatial_dim = width + width * 2 + width * 4
-
-        # 频域分支
-        self.freq_branch = nn.Sequential(
-            nn.Conv2d(3, width, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.AvgPool2d(2),
-            nn.Conv2d(width, width * 2, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(width * 2, width * 2, 3, 1, 1), nn.ReLU(inplace=True)
-        )
-        self.freq_pool = nn.AdaptiveAvgPool2d(1)
-        freq_dim = width * 2
-
-        self.spatial_proj = nn.Linear(spatial_dim, 256)
-        self.freq_proj = nn.Linear(freq_dim, 256)
-        self.attention = nn.Sequential(
-            nn.Linear(512, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, 1)
-        )
-        self.head = nn.Sequential(
-            nn.Linear(256, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, wm_dim)
-        )
-
-    @staticmethod
-    def _fft_magnitude(x):
-        freq = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
-        return torch.sqrt(freq.real ** 2 + freq.imag ** 2 + 1e-6)
-
-    def forward(self, x_bchw):
-        if x_bchw.dim() == 3:
-            x_bchw = x_bchw.unsqueeze(0)
-
-        f1 = self.stem(x_bchw)
-        f2 = self.down1(f1)
-        f3 = self.down2(f2)
-        g1 = self.pool(f1).flatten(1)
-        g2 = self.pool(f2).flatten(1)
-        g3 = self.pool(f3).flatten(1)
-        spatial_feat = torch.cat([g1, g2, g3], dim=1)
-
-        freq_input = self._fft_magnitude(x_bchw)
-        freq_feat = self.freq_branch(freq_input)
-        freq_feat = self.freq_pool(freq_feat).flatten(1)
-
-        spatial_embed = self.spatial_proj(spatial_feat)
-        freq_embed = self.freq_proj(freq_feat)
-        attn = torch.sigmoid(self.attention(torch.cat([spatial_embed, freq_embed], dim=1)))
-        fused = attn * spatial_embed + (1 - attn) * freq_embed
-        return self.head(fused)
-
-
-class ProjectionHead(nn.Module):
-    def __init__(self, dim, hidden=128, out_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, out_dim)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-def compute_ber_from_logits(wm_logits, true_bits, threshold=0.5, use_sigmoid=True, per_sample=False, tb_writer=None, step=None, progress_bar=None, tb_tag='metrics/BER'):
-    if wm_logits.dim() == 1:
-        wm_logits = wm_logits.unsqueeze(0)
-    if true_bits.dim() == 1:
-        true_bits = true_bits.unsqueeze(0)
-    if true_bits.shape[0] == 1 and wm_logits.shape[0] > 1:
-        true_bits = true_bits.expand(wm_logits.shape[0], -1)
-    if true_bits.shape != wm_logits.shape:
-        raise ValueError(f"shape mismatch: wm_logits {wm_logits.shape}, true_bits {true_bits.shape}")
-
-    if use_sigmoid:
-        preds = (torch.sigmoid(wm_logits) > threshold)
+def degree_weights(max_sh_degree: int, power: float = 1.0) -> torch.Tensor:
+    # 给高阶更大权重，保护低阶（低阶更影响整体颜色/PSNR）
+    deg_idx = build_sh_degree_index(max_sh_degree)  # shape [sh_dim]
+    if max_sh_degree <= 0:
+        w = torch.ones_like(deg_idx)
     else:
-        preds = (wm_logits > 0.0)
-    trues = (true_bits > 0.5)
-
-    diff = (preds != trues).float()
-    per_sample_ber = diff.mean(dim=1)
-    mean_ber = per_sample_ber.mean().item()
-
-    return per_sample_ber if per_sample else mean_ber
+        w = (deg_idx / max_sh_degree).pow(power)  # [0..1]^p
+        w[deg_idx == 0] = 0.0  # 强烈保护 DC 项
+    return w  # shape [sh_dim]
 
 
-def info_nce_loss(message_bits, pred_logits, msg_projector, pred_projector, temperature=0.07, num_negatives=16):
-    """基于 InfoNCE 的互信息最大化目标"""
-    if message_bits.dim() == 1:
-        message_bits = message_bits.unsqueeze(0)
-    negatives = torch.randint(
-        0, 2, (num_negatives, message_bits.shape[1]), device=message_bits.device, dtype=message_bits.dtype
-    )
-    all_messages = torch.cat([message_bits, negatives], dim=0)
-    msg_embed = F.normalize(msg_projector(all_messages), dim=-1)
-    pred_embed = F.normalize(pred_projector(torch.sigmoid(pred_logits)), dim=-1)
-    pos = torch.sum(pred_embed * msg_embed[0:1], dim=-1, keepdim=True)
-    neg = pred_embed @ msg_embed[1:].T
-    logits = torch.cat([pos, neg], dim=-1) / temperature
-    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-    return F.cross_entropy(logits, labels)
+# ------------------ 编码器：输出 SH offset ------------------
+class WatermarkSHOffsetEncoder(nn.Module):
+    """
+    输入: message (1, wm_dim) in {0,1}
+    输出: sh_offset_base (sh_dim, 3), 再扩展到 (N, sh_dim, 3) 用于所有点
+    """
+    def __init__(self, wm_dim: int, sh_dim: int, alpha: float = 0.01, deg_weight: torch.Tensor = None, hidden: int = 256):
+        super().__init__()
+        self.wm_dim = wm_dim
+        self.sh_dim = sh_dim
+        self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32), requires_grad=False)
+        self.net = nn.Sequential(
+            nn.Linear(wm_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, sh_dim * 3),
+            nn.Tanh()  # 限幅到 [-1,1]，再乘以 alpha
+        )
+        self.register_buffer("deg_weight", torch.ones(sh_dim, dtype=torch.float32) if deg_weight is None else deg_weight)
+
+    def forward(self, message: torch.Tensor):
+        # message: (1, wm_dim), 值域 {0,1}
+        x = self.net(message)  # (1, sh_dim*3)
+        x = x.view(1, self.sh_dim, 3)  # (1, sh_dim, 3)
+        # 按阶权重：保护低阶，强调高阶
+        x = x * self.deg_weight.view(1, self.sh_dim, 1)
+        # 缩放幅度
+        x = x * self.alpha
+        return x  # (1, sh_dim, 3)
+
+
+# ------------------ 解码器（更稳健，输出logits） ------------------
+class WatermarkDecoder(nn.Module):
+    def __init__(self, wm_dim=32, in_channels=3):
+        super().__init__()
+        # 轻量但更稳解码器
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.AvgPool2d(2),  # downsample
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.AvgPool2d(2),  # downsample
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        self.fc = nn.Linear(128, wm_dim)
+
+    def forward(self, render_img):
+        """
+        render_img: (3,H,W) 或 (1,3,H,W)
+        返回: (1, wm_dim) logits
+        """
+        if render_img.dim() == 3:
+            render_img = render_img.unsqueeze(0)
+        feats = self.encoder(render_img)
+        feats = feats.view(feats.size(0), -1)
+        logits = self.fc(feats)
+        return logits
+
+
+# ------------------ 轻量可微增强 ------------------
+class SimpleAugment(nn.Module):
+    def __init__(self, noise_std=0.01, brightness=0.05, contrast=0.05):
+        super().__init__()
+        self.noise_std = noise_std
+        self.brightness = brightness
+        self.contrast = contrast
+
+    def forward(self, img):
+        # img: (1,3,H,W) 或 (3,H,W)
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        b, c, h, w = img.shape
+        out = img
+        # 轻微高斯噪声
+        if self.noise_std > 0:
+            out = out + torch.randn_like(out) * self.noise_std
+        # 亮度/对比度扰动（保持可微）
+        if self.brightness > 0:
+            b_shift = (torch.randn(b, 1, 1, 1, device=out.device) * self.brightness)
+            out = out + b_shift
+        if self.contrast > 0:
+            c_scale = 1.0 + (torch.randn(b, 1, 1, 1, device=out.device) * self.contrast)
+            mean = out.mean(dim=(2, 3), keepdim=True)
+            out = (out - mean) * c_scale + mean
+        out = torch.clamp(out, 0.0, 1.0)
+        return out
+
 
 # ------------------ 训练函数 ------------------
 def training(dataset, opt, pipe, args):
@@ -249,117 +172,164 @@ def training(dataset, opt, pipe, args):
     scene = Scene(args, gaussian, shuffle=False)
     checkpoint = os.path.join(args.model_path, args.start_checkpoint)
     print(f"Loading checkpoint from {checkpoint}")
-    (model_params, _) = torch.load(checkpoint)
+    (model_params, _) = torch.load(checkpoint, map_location=device)
     gaussian.restore(model_params, args)
     gaussian.training_watermark_setup(args)
 
+    # 背景设置
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device=device)
 
-    encoder = WatermarkEncoder(color_dim=3, wm_dim=args.message_length).to(device)
-    decoder = WatermarkDecoder(wm_dim=args.message_length).to(device)
-    msg_projector = ProjectionHead(args.message_length).to(device)
-    pred_projector = ProjectionHead(args.message_length).to(device)
-    optimizer = torch.optim.Adam(
-        list(encoder.parameters()) +
-        list(decoder.parameters()) +
-        list(msg_projector.parameters()) +
-        list(pred_projector.parameters()), lr=1e-4
-    )
-    criterion_BCE = nn.BCEWithLogitsLoss()
+    # SH维度
+    sh_dim = (gaussian.max_sh_degree + 1) ** 2
+    deg_w = degree_weights(gaussian.max_sh_degree, power=args.deg_weight_power)
 
-    viewpoint_stack = None
+    # 模型
+    encoder = WatermarkSHOffsetEncoder(
+        wm_dim=args.message_length, sh_dim=sh_dim, alpha=args.wm_alpha, deg_weight=deg_w, hidden=args.encoder_hidden
+    ).to(device)
+    decoder = WatermarkDecoder(wm_dim=args.message_length).to(device)
+
+    # 优化器与损失
+    optimizer = torch.optim.Adam(
+        list(encoder.parameters()) + list(decoder.parameters()), lr=args.lr
+    )
+    bce_with_logits = nn.BCEWithLogitsLoss()
+
+    # 数据增强
+    aug = SimpleAugment(noise_std=args.aug_noise_std, brightness=args.aug_brightness, contrast=args.aug_contrast).to(device)
+
+    # 训练进度
     progress_bar = tqdm(range(1, opt.water_iterations + 1), desc="Training progress")
 
+    # 提前准备视角列表
+    all_train_cams = scene.getTrainCameras().copy()
+
     for iteration in range(1, opt.water_iterations + 1):
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        bg = torch.rand((3), device=device) if opt.random_background else background
+        # 小批量视角
+        if len(all_train_cams) < args.num_views:
+            all_train_cams = scene.getTrainCameras().copy()
 
-        shs_view = gaussian.get_features.transpose(1, 2).view(-1, 3, (gaussian.max_sh_degree + 1) ** 2)
-        dir_pp = (gaussian.get_xyz - viewpoint_cam.camera_center.repeat(gaussian.get_features.shape[0], 1))
-        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-        sh2rgb = eval_sh(gaussian.active_sh_degree, shs_view, dir_pp_normalized)
-        colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        # 随机取 K 个不同视角
+        cams = []
+        for _ in range(args.num_views):
+            idx = randint(0, len(all_train_cams) - 1)
+            cams.append(all_train_cams.pop(idx))
 
-        # 随机生成水印比特
-        message = torch.randint(0, 2, (1, args.message_length), device=device, dtype=torch.float32)
+        total_loss = 0.0
+        total_render_loss = 0.0
+        total_msg_loss = 0.0
+        total_ber = 0.0
 
-        # 编码
-        wm_color = encoder(colors_precomp, message)
-        # 渲染
-        render_pkg = render(viewpoint_cam, gaussian, pipe, bg, override_color=wm_color)
-        render_image = render_pkg["render"]
-        # 解码
-        wm_pred = decoder(render_image)
+        # 随机生成水印，比特{0,1}
+        message = torch.randint(low=0, high=2, size=(1, args.message_length), device=device).float()
 
-        # 损失
-        loss_render = (1.0 - opt.lambda_dssim) * l1_loss(viewpoint_cam.original_image.cuda(), render_image) + \
-                      opt.lambda_dssim * (1.0 - ssim(viewpoint_cam.original_image.cuda(), render_image))
+        # 由水印 -> SH offset（全局），广播到所有点
+        sh_offset_base = encoder(message)  # (1, sh_dim, 3)
+        # 不让消息损失反向传播到原 SH（保护 PSNR），只使用其值参与合成颜色
+        sh_features = gaussian.get_features.detach()  # (N, sh_dim, 3)
+        # 广播 offset 到所有点
+        sh_offset = sh_offset_base.expand(sh_features.shape[0], -1, -1)  # (N, sh_dim, 3)
 
-        loss_message = criterion_BCE(wm_pred, message)
-        loss_info = info_nce_loss(
-            message,
-            wm_pred,
-            msg_projector,
-            pred_projector,
-            temperature=args.info_temperature,
-            num_negatives=args.num_info_negatives
-        )
-        loss = loss_render + args.lambda_message * loss_message + args.lambda_info * loss_info
+        # 多视角累积
+        optimizer.zero_grad(set_to_none=True)
+        for viewpoint_cam in cams:
+            bg = torch.rand((3), device=device) if opt.random_background else background
 
-        # backward
-        loss.backward()
+            # 计算该视角方向向量
+            dir_pp = (gaussian.get_xyz.detach() - viewpoint_cam.camera_center.repeat(gaussian.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-8)
+
+            # 用(原SH + offset)合成视角颜色
+            # get_features: (N, sh_dim, 3) -> (N,3,sh_dim)
+            shs_view = (sh_features + sh_offset).transpose(1, 2).contiguous().view(-1, 3, sh_dim)
+            wm_color = eval_sh(gaussian.active_sh_degree, shs_view, dir_pp_normalized)
+            # 贴近渲染器色域：3DGS 通常是 [-0.5, +0.5] + 0.5 或类似，这里与原代码保持一致
+            wm_color = torch.clamp(wm_color + 0.5, 0.0, 1.0)
+
+            # 用 override_color 渲染
+            render_pkg = render(viewpoint_cam, gaussian, pipe, bg, override_color=wm_color)
+            render_image = render_pkg["render"]  # 期望 (3,H,W) 且在 [0,1]
+
+            # 轻量鲁棒增强
+            if args.use_augment:
+                render_image_for_dec = aug(render_image).squeeze(0)
+            else:
+                render_image_for_dec = render_image
+
+            # 解码（输出logits）
+            wm_logits = decoder(render_image_for_dec)
+
+            # 损失
+            # - 图像重建: 与GT贴合（保护PSNR/SSIM）
+            gt = viewpoint_cam.original_image.to(device)
+            loss_render = (1.0 - opt.lambda_dssim) * l1_loss(gt, render_image) + \
+                          opt.lambda_dssim * (1.0 - ssim(gt, render_image))
+
+            # - 消息: BCEWithLogitsLoss
+            loss_message = bce_with_logits(wm_logits, message)
+
+            # 权重随训练进程ramp-up（先稳图像，再拉BER）
+            if args.lambda_msg_ramp > 0:
+                ramp = min(1.0, iteration / args.lambda_msg_ramp)
+                lambda_msg_eff = args.lambda_msg * ramp
+            else:
+                lambda_msg_eff = args.lambda_msg
+
+            loss = loss_render + lambda_msg_eff * loss_message
+
+            # 反向传播（累积）
+            loss.backward()
+
+            # BER统计（不参与反传）
+            with torch.no_grad():
+                probs = torch.sigmoid(wm_logits)
+                pred_bits = (probs > 0.5).float()
+                ber = (pred_bits != message).float().mean().item()
+                total_ber += ber
+                total_loss += loss.item()
+                total_render_loss += loss_render.item()
+                total_msg_loss += loss_message.item()
+
+        # 更新
+        torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(decoder.parameters()), max_norm=1.0)
+        optimizer.step()
 
         with torch.no_grad():
-            # 在训练循环中（在 `wm_pred = decoder(render_image)` 之后，loss 计算前或后均可），插入如下调用：
-            # 计算并输出 BER（示例放在解码后）
-            ber = compute_ber_from_logits(wm_pred, message, threshold=0.5, use_sigmoid=True, per_sample=False,
-                                          tb_writer=tb_writer, step=iteration, progress_bar=progress_bar)
-            # print(f"[ITER {iteration}] BER: {ber:.4f}")
-            if iteration % 100 == 0 or iteration == opt.water_iterations:
-                target = viewpoint_cam.original_image.cuda()
-                pred = render_image
-                mse = torch.mean((target - pred) ** 2).item()
-                psnr = 10.0 * np.log10(1.0 / mse) if mse > 0 else float('inf')
-                ssim_val = ssim(target, pred)
-                if isinstance(ssim_val, torch.Tensor):
-                    ssim_val = ssim_val.item()
-                print(f"[ITER {iteration}] PSNR: {psnr:.2f} dB, SSIM: {ssim_val:.2f}, BER: {ber:.2f}")
-                if tb_writer:
-                    tb_writer.add_scalar('metrics/PSNR', psnr, iteration)
-                    tb_writer.add_scalar('metrics/SSIM', ssim_val, iteration)
-                    tb_writer.add_scalar('metrics/BER', ber, iteration)
-
-            # Progress bar
             if iteration % 10 == 0:
-                progress_bar.set_postfix(
-                    {"Loss": f"{loss.item():.{3}f}",
-                     "l_m": f"{loss_message.item():.{3}f}",
-                     "l_i": f"{loss_info.item():.{3}f}",
-                     "l_r": f"{loss_render.item():.{3}f}",
-                     "BER": f"{ber:.3f}"})
+                k = float(args.num_views)
+                progress_bar.set_postfix({
+                    "Loss": f"{(total_loss/k):.6f}",
+                    "L_img": f"{(total_render_loss/k):.6f}",
+                    "L_msg": f"{(total_msg_loss/k):.6f}",
+                    "BER": f"{(total_ber/k):.4f}"
+                })
                 progress_bar.update(10)
+                if tb_writer is not None:
+                    tb_writer.add_scalar("loss/total", total_loss / k, iteration)
+                    tb_writer.add_scalar("loss/render", total_render_loss / k, iteration)
+                    tb_writer.add_scalar("loss/message", total_msg_loss / k, iteration)
+                    tb_writer.add_scalar("metric/BER", total_ber / k, iteration)
+                    tb_writer.add_scalar("hyper/lambda_msg_eff", lambda_msg_eff, iteration)
+
             if iteration == opt.water_iterations:
                 progress_bar.close()
-            # Log and save
+
+            # 保存（这里只保存编码器/解码器；真正把 offset 烘入模型建议用第二阶段流程）
             if (iteration in args.save_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                print(f"\n[ITER {iteration}] Saving checkpoints")
+                # 保存当前 3DGS 快照（未改动SH，保持一致）
                 torch.save((gaussian.capture(), iteration),
-                           scene.model_path + f"/chkpnt_{args.message_length}_{iteration}_{args.exp_name}.pth")
-
-                # 保存编码器和解码器
+                           os.path.join(scene.model_path, f"chkpnt_{args.message_length}_{iteration}_{args.exp_name}.pth"))
+                # 保存编码器/解码器
                 torch.save(encoder.state_dict(),
-                           os.path.join(scene.model_path, f"encoder_{iteration}_{args.exp_name}.pth"))
+                           os.path.join(scene.model_path, f"encoder_{args.message_length}_{iteration}_{args.exp_name}.pth"))
                 torch.save(decoder.state_dict(),
-                           os.path.join(scene.model_path, f"decoder_{iteration}_{args.exp_name}.pth"))
-            if iteration < opt.water_iterations:
-                gaussian.optimizer.step()
-                gaussian.optimizer.zero_grad(set_to_none=True)
+                           os.path.join(scene.model_path, f"decoder_{args.message_length}_{iteration}_{args.exp_name}.pth"))
 
-                optimizer.step()
-                optimizer.zero_grad()
+    # 训练完成
+    print("\nTraining complete.")
+
 
 # ------------------ 主函数 ------------------
 if __name__ == "__main__":
@@ -378,13 +348,22 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default="chkpnt30000.pth")
     parser.add_argument("--message_length", type=int, default=32)
-    parser.add_argument("--lambda_message", type=float, default=1.0)
-    parser.add_argument("--lambda_info", type=float, default=0.1)
-    parser.add_argument("--info_temperature", type=float, default=0.07)
-    parser.add_argument("--num_info_negatives", type=int, default=32)
+
+    # 新增超参
+    parser.add_argument("--exp_name", type=str, default="wm_shoffset")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--wm_alpha", type=float, default=0.02, help="SH offset全局幅度（小幅保障PSNR）")
+    parser.add_argument("--deg_weight_power", type=float, default=1.0, help="按阶权重指数，>1更强调高阶")
+    parser.add_argument("--lambda_msg", type=float, default=1.0, help="消息损失权重基值")
+    parser.add_argument("--lambda_msg_ramp", type=int, default=1000, help="消息权重ramp-up步数，0表示禁用")
+    parser.add_argument("--num_views", type=int, default=1, help="每步采样的视角数量（>1可提升跨视角一致性）")
+    parser.add_argument("--use_augment", action="store_true", default=True)
+    parser.add_argument("--aug_noise_std", type=float, default=0.01)
+    parser.add_argument("--aug_brightness", type=float, default=0.05)
+    parser.add_argument("--aug_contrast", type=float, default=0.05)
+    parser.add_argument("--encoder_hidden", type=int, default=256)
 
     args = parser.parse_args()
     safe_state(args.quiet)
 
     training(lp.extract(args), op.extract(args), pp.extract(args), args)
-    print("\nTraining complete.")
