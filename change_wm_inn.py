@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from random import randint
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
+from hidden.hidden_images import encoder, decoder, params, str2msg, msg2str, default_transform, NORMALIZE_IMAGENET, UNNORMALIZE_IMAGENET, EncoderWithJND, JND, encoder_with_jnd
 import uuid
 
 # ------------------ GPU选择 ------------------
@@ -141,27 +142,71 @@ class WatermarkDecoder(nn.Module):
         g  = torch.cat([g1,g2,g3], dim=1)
         return self.head(g)         # (B, wm_dim)
 
-def compute_ber_from_logits(wm_logits, true_bits, threshold=0.5, use_sigmoid=True, per_sample=False, tb_writer=None, step=None, progress_bar=None, tb_tag='metrics/BER'):
-    if wm_logits.dim() == 1:
-        wm_logits = wm_logits.unsqueeze(0)
+def compute_ber_hidden_decoder(decoder_out, true_bits, threshold=0.0, per_sample=False, tb_writer=None, step=None, progress_bar=None, tb_tag='metrics/BER'):
+    """
+    根据 hidden 的 decoder 输出计算 BER（decoder 输出直接比较 threshold，默认 threshold=0.0）。
+    - decoder_out: Tensor (B, L) 或 (L,)
+    - true_bits: Tensor (B, L) 或 (L,) ，可为 bool / {0,1} / {-1,1}
+    - threshold: 判定为 1 的阈值（hidden decoder 使用 0.0）
+    - per_sample: True 则返回每个样本的 BER Tensor，否则返回 float 平均 BER
+    - tb_writer/step/progress_bar: 可选用于记录/显示
+    """
+    # 规范形状
+    if decoder_out.dim() == 1:
+        decoder_out = decoder_out.unsqueeze(0)
     if true_bits.dim() == 1:
         true_bits = true_bits.unsqueeze(0)
-    if true_bits.shape[0] == 1 and wm_logits.shape[0] > 1:
-        true_bits = true_bits.expand(wm_logits.shape[0], -1)
-    if true_bits.shape != wm_logits.shape:
-        raise ValueError(f"shape mismatch: wm_logits {wm_logits.shape}, true_bits {true_bits.shape}")
 
-    if use_sigmoid:
-        preds = (torch.sigmoid(wm_logits) > threshold)
+    B, L = decoder_out.shape
+    if true_bits.shape[0] == 1 and B > 1:
+        true_bits = true_bits.expand(B, -1)
+    if true_bits.shape != decoder_out.shape:
+        raise ValueError(f"shape mismatch: decoder_out {decoder_out.shape}, true_bits {true_bits.shape}")
+
+    # 预测比特：直接用 threshold（hidden decoder 用 ft > 0 判为 1）
+    preds = (decoder_out > threshold)
+
+    # 处理 true_bits 的多种表示
+    if true_bits.dtype == torch.bool:
+        trues = true_bits
     else:
-        preds = (wm_logits > 0.0)
-    trues = (true_bits > 0.5)
+        # 若为 -1/1，转为 0/1；若为 0/1，按 >0.5 为 1
+        unique_vals = torch.unique(true_bits)
+        if (unique_vals == -1).any():
+            trues = (true_bits > 0)
+        else:
+            trues = (true_bits > 0.5)
 
-    diff = (preds != trues).float()
-    per_sample_ber = diff.mean(dim=1)
+    # 计算 BER
+    diff = (preds != trues).float()  # (B, L)
+    per_sample_ber = diff.mean(dim=1)  # (B,)
     mean_ber = per_sample_ber.mean().item()
 
+    # 写入 TensorBoard（如提供）
+    if tb_writer is not None and step is not None:
+        try:
+            tb_writer.add_scalar(tb_tag, mean_ber, step)
+        except Exception:
+            pass
+
+    # 更新进度条后缀（如提供）
+    if progress_bar is not None:
+        try:
+            progress_bar.set_postfix({"BER": f"{mean_ber:.4f}"})
+        except Exception:
+            pass
+
     return per_sample_ber if per_sample else mean_ber
+
+def create_message(input_msg, random_msg=False):
+    # create message
+    if random_msg:
+        msg_ori = torch.randint(0, 2, (1, args.message_length), device="cuda").bool() # b k
+    else:
+        msg_ori = torch.Tensor(str2msg(input_msg)).unsqueeze(0)
+    msg_ori = msg_ori.cuda()
+    # msg = 2 * msg_ori.type(torch.float) - 1 # b k
+    return msg_ori
 
 # ------------------ 训练函数 ------------------
 def training(dataset, opt, pipe, args):
@@ -178,7 +223,7 @@ def training(dataset, opt, pipe, args):
     background = torch.tensor(bg_color, dtype=torch.float32, device=device)
 
     encoder = WatermarkEncoder(color_dim=3, wm_dim=args.message_length).to(device)
-    decoder = WatermarkDecoder(wm_dim=args.message_length).to(device)
+    # decoder = WatermarkDecoder(wm_dim=args.message_length).to(device)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()), lr=1e-4
     )
@@ -201,21 +246,31 @@ def training(dataset, opt, pipe, args):
 
         # 随机生成水印比特
         message = torch.Tensor(np.random.choice([0, 1], (1, args.message_length))).to(device)
+        # message = create_message("111010110101000001010111010011010100010000100111")
 
         # 编码
         wm_color = encoder(colors_precomp, message)
+        # decode
+
         # 渲染
         render_pkg = render(viewpoint_cam, gaussian, pipe, bg, override_color=wm_color)
         render_image = render_pkg["render"]
+
         # 解码
-        wm_pred = decoder(render_image)
+        # wm_pred = decoder(render_image)
+        nom_image = NORMALIZE_IMAGENET(render_image.unsqueeze(0))
+        ft = decoder(nom_image)
 
         # 损失
         loss_render = (1.0 - opt.lambda_dssim) * l1_loss(viewpoint_cam.original_image.cuda(), render_image) + \
                       opt.lambda_dssim * (1.0 - ssim(viewpoint_cam.original_image.cuda(), render_image))
 
-        loss_message = criterion_MSE(message, wm_pred)
-        loss = loss_render + loss_message
+        # Binary Cross Entropy Loss
+        bce_loss = F.binary_cross_entropy_with_logits(ft, message)
+        loss = 10 * loss_render + bce_loss
+
+        # loss_message = criterion_MSE(message, wm_pred)
+        # loss = loss_render + loss_message
 
         # backward
         loss.backward()
@@ -223,8 +278,7 @@ def training(dataset, opt, pipe, args):
         with torch.no_grad():
             # 在训练循环中（在 `wm_pred = decoder(render_image)` 之后，loss 计算前或后均可），插入如下调用：
             # 计算并输出 BER（示例放在解码后）
-            ber = compute_ber_from_logits(wm_pred, message, threshold=0.5, use_sigmoid=True, per_sample=False,
-                                          tb_writer=tb_writer, step=iteration, progress_bar=progress_bar)
+            ber = compute_ber_hidden_decoder(ft, message, threshold=0.0, per_sample=False)
             # print(f"[ITER {iteration}] BER: {ber:.4f}")
             if iteration % 100 == 0 or iteration == opt.water_iterations:
                 target = viewpoint_cam.original_image.cuda()
@@ -243,7 +297,7 @@ def training(dataset, opt, pipe, args):
             # Progress bar
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
-                    {"Loss": f"{loss.item():.{3}f}", "l_m": f"{loss_message.item():.{3}f}", "l_r": f"{loss_render.item():.{3}f}", "BER": f"{ber:.3f}"})
+                    {"Loss": f"{loss.item():.{3}f}", "l_b": f"{bce_loss.item():.{3}f}", "l_r": f"{loss_render.item():.{3}f}", "BER": f"{ber:.3f}"})
                 progress_bar.update(10)
             if iteration == opt.water_iterations:
                 progress_bar.close()
@@ -276,12 +330,13 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[8_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[8_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default="chkpnt30000.pth")
-    parser.add_argument("--message_length", type=int, default=32)
+    parser.add_argument("--exp_name", type=str, default="xjf")
+    parser.add_argument("--message_length", type=int, default=48)
 
     args = parser.parse_args()
     safe_state(args.quiet)

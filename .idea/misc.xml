@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="octreegs" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="octreegs" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="wm" project-jdk-type="Python SDK" />
 </project>

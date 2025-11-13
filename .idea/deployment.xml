@@ -86,6 +86,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="xjf@10.21.22.49:22 password (6)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data/xjf/Projects/gswater" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
     </serverData>
     <option name="myAutoUpload" value="ON_EXPLICIT_SAVE" />
   </component>
